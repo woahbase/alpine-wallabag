@@ -1,0 +1,129 @@
+#!/usr/bin/with-contenv bash
+set -e
+
+vecho () { if [ "${S6_VERBOSITY:-1}" -gt 0 ]; then echo "[$0] $@"; fi; }
+
+# refer to https://doc.wallabag.org/en/admin/console_commands.html for custom commands
+# application specific configurations
+
+ROOTDIR="${ROOTDIR:-/config}";
+WEBDIR="${WEBDIR:-$ROOTDIR/www}";
+
+# ensure SYMFONY_ENV is set in environments (or Dockerfile)
+# SYMFONY_ENV="${SYMFONY_ENV:-prod}"; # set in Dockerfile
+# WALLABAG_SRC="${WALLABAG_SRC:-/opt/wallabag/wallabag-${VERSION}.tar.gz}"; # set in Dockerfile
+WALLABAGDIR="${WALLABAGDIR:-$WEBDIR/wallabag}"; # note: no ending /
+SRCVERSION="$(cat /opt/wallabag/version 2>/dev/null)";
+WALLABAG_PARAMSFILE="${WALLABAG_PARAMSFILE:-/defaults/parameters.yml}"; # mount custom config here
+
+# create our folders/files
+vecho "Ensure configuration directories exit";
+mkdir -p \
+    "${ROOTDIR}/log/wallabag" \
+    "${WALLABAGDIR}" \
+    "${WALLABAGDIR}/app" \
+    "${WALLABAGDIR}/app/config" \
+    "${WALLABAGDIR}/data" \
+    "${WALLABAGDIR}/data/assets" \
+    "${WALLABAGDIR}/data/db" \
+    ;
+    #
+
+if [ ! -f "${WALLABAGDIR}/web/app.php" ];
+then
+    vecho "Setting up WallaBag ${SRCVERSION} at ${WALLABAGDIR}";
+    # extract wallabag
+    tar -xzf "${WALLABAG_SRC}" --strip 1 -C "${WALLABAGDIR}";
+
+    # make sure initialization tasks run for first-time setup
+    WALLABAG_DBINSTALL="${WALLABAG_DBINSTALL:-true}"; # enable db-install if not overridden
+    WALLABAG_MIGRATE="${WALLABAG_MIGRATE:-false}"; # not needed right after installation
+# else
+#     vecho "Wallabag sources found";
+fi;
+
+# copy default config if exists
+if [ -n "${WALLABAG_PARAMSFILE}" ] \
+&& [ -f "${WALLABAG_PARAMSFILE}" ];
+# && [ ! -f "${WALLABAGDIR}/app/config/parameters.yml" ];
+then
+    vecho "Setting up default configurations at ${WALLABAGDIR}/app/config/parameters.yml";
+    cp "${WALLABAG_PARAMSFILE}" "${WALLABAGDIR}/app/config/parameters.yml";
+fi;
+
+# fix permissions
+vecho "Fixing permissions.";
+find "${WALLABAGDIR}" "$ROOTDIR/log/wallabag" \
+    \! -user ${S6_USER:-alpine} -exec \
+    chown --no-dereference \
+    ${S6_USER:-alpine}:${PGID:-1000} \
+    '{}' +;
+
+cd "${WALLABAGDIR}" || exit 1;
+# any app-specific commands below should execute as non-root
+
+# disabled by default, set to non-empty-string to run package installation tasks
+if [ -n "${WALLABAG_UPDATE_DEPS}" ];
+then
+    vecho "Installing composer...";
+    curl -s https://getcomposer.org/installer | php \
+        && mv composer.phar /usr/local/bin/composer \
+        && composer selfupdate --2 \
+    ;
+    vecho "Installing dependencies...";
+    s6-setuidgid ${S6_USER:-alpine} \
+        composer install \
+            --no-dev \
+            -o \
+            --prefer-dist \
+            --no-progress \
+        ;
+fi;
+
+# does not run by default, set to true to run database install task (for first-run)
+if [ "${WALLABAG_DBINSTALL^^}" == "TRUE" ];
+then
+    vecho "Running database initialization...";
+    s6-setuidgid ${S6_USER:-alpine} \
+        php ./bin/console \
+            wallabag:install \
+            --env="${SYMFONY_ENV}" \
+            --no-interaction \
+        ;
+fi;
+
+# does not run by default, set to true to run database migration task
+if [ "${WALLABAG_MIGRATE^^}" == "TRUE" ];
+then
+    vecho "Running database migrations...";
+    s6-setuidgid ${S6_USER:-alpine} \
+        php ./bin/console \
+            doctrine:migrations:migrate \
+            --env="${SYMFONY_ENV}" \
+            --no-interaction \
+        ;
+fi;
+
+# does not run by default, set to non-empty-string to run task
+if [ -n "${WALLABAG_CLEAR_CACHE}" ];
+then
+    vecho "Clearing application cache.";
+    s6-setuidgid ${S6_USER:-alpine} \
+        php ./bin/console \
+            cache:clear \
+            --env="${SYMFONY_ENV}" \
+        ;
+fi;
+
+# generate proxy classes, runs by default, set to non-empty-string to skip
+if [ -z "${WALLABAG_SKIP_CACHEWARMUP}" ];
+then
+    vecho "Running cache warm-up.";
+    s6-setuidgid ${S6_USER:-alpine} \
+        php ./bin/console \
+            cache:warmup \
+            --env="${SYMFONY_ENV}" \
+        ;
+fi;
+
+vecho "Done.";
