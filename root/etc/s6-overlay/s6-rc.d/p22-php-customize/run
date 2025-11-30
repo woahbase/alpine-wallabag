@@ -2,6 +2,7 @@
 set -e
 
 vecho () { if [ "${S6_VERBOSITY:-1}" -gt 0 ]; then echo "[$0] $@"; fi; }
+usercmd () { if [ "X${EUID}" != "X0" ]; then ${1} "${@:2}"; else s6-setuidgid ${PUID:-1000}:${PGID:-1000} ${1} "${@:2}"; fi; }
 
 # refer to https://doc.wallabag.org/en/admin/console_commands.html for custom commands
 # application specific configurations
@@ -52,12 +53,16 @@ then
 fi;
 
 # fix permissions
-vecho "Fixing permissions.";
-find "${WALLABAGDIR}" "$ROOTDIR/log/wallabag" \
-    \! -user ${S6_USER:-alpine} -exec \
-    chown --no-dereference \
-    ${S6_USER:-alpine}:${PGID:-1000} \
-    '{}' +;
+if [ -z "${PHP_SKIP_PERMFIX}" ] \
+&& [ "X${EUID}" == "X0" ]; # requires root
+then
+    vecho "Fixing permissions.";
+    find "${WALLABAGDIR}" "$ROOTDIR/log/wallabag" \
+        \! -user ${S6_USER:-alpine} -exec \
+        chown --no-dereference \
+        ${S6_USER:-alpine}:${PGID:-1000} \
+        '{}' +;
+fi;
 
 cd "${WALLABAGDIR}" || exit 1;
 # any app-specific commands below should execute as non-root
@@ -71,7 +76,7 @@ then
         && composer selfupdate --2 \
     ;
     vecho "Installing dependencies...";
-    s6-setuidgid ${S6_USER:-alpine} \
+    usercmd \
         composer install \
             --no-dev \
             -o \
@@ -84,7 +89,7 @@ fi;
 if [ "${WALLABAG_DBINSTALL^^}" == "TRUE" ];
 then
     vecho "Running database initialization...";
-    s6-setuidgid ${S6_USER:-alpine} \
+    usercmd \
         php ./bin/console \
             wallabag:install \
             --env="${SYMFONY_ENV}" \
@@ -96,7 +101,7 @@ fi;
 if [ "${WALLABAG_MIGRATE^^}" == "TRUE" ];
 then
     vecho "Running database migrations...";
-    s6-setuidgid ${S6_USER:-alpine} \
+    usercmd \
         php ./bin/console \
             doctrine:migrations:migrate \
             --env="${SYMFONY_ENV}" \
@@ -108,7 +113,7 @@ fi;
 if [ -n "${WALLABAG_CLEAR_CACHE}" ];
 then
     vecho "Clearing application cache.";
-    s6-setuidgid ${S6_USER:-alpine} \
+    usercmd \
         php ./bin/console \
             cache:clear \
             --env="${SYMFONY_ENV}" \
@@ -119,7 +124,7 @@ fi;
 if [ -z "${WALLABAG_SKIP_CACHEWARMUP}" ];
 then
     vecho "Running cache warm-up.";
-    s6-setuidgid ${S6_USER:-alpine} \
+    usercmd \
         php ./bin/console \
             cache:warmup \
             --env="${SYMFONY_ENV}" \
